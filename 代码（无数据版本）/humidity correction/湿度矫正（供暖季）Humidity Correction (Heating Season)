@@ -1,0 +1,165 @@
+import os
+import glob
+import zipfile
+import pandas as pd
+
+# ============================================================
+# Data requiring humidity correction
+# ============================================================
+SENSOR_ID  = "name"
+ZIP_PATH   = r"address"
+OUTPUT_DIR = r"address"
+KAPPA      = 0.38
+RH_CAP     = 85
+
+# ============================================================
+# Read all CSV files within the ZIP archive.
+# ============================================================
+all_dfs = []
+skipped = 0
+
+with zipfile.ZipFile(ZIP_PATH, 'r') as z:
+    csv_files = sorted([f for f in z.namelist() if f.endswith('.csv')])
+    for fname in csv_files:
+        info = z.getinfo(fname)
+        if info.file_size < 1000:
+            print(f"跳过空文件: {fname} ({info.file_size} 字节)")
+            skipped += 1
+            continue
+        with z.open(fname) as f:
+            try:
+                df = pd.read_csv(f)
+                df['source_file'] = fname
+                all_dfs.append(df)
+                print(f"已读取: {fname}, 行数: {len(df)}")
+            except Exception as e:
+                print(f"读取失败: {fname}, 原因: {e}")
+                skipped += 1
+
+print(f"\n共跳过: {skipped} 个文件")
+
+if not all_dfs:
+    print("No data was read; please check the ZIP path and file contents.")
+    exit()
+
+combined = pd.concat(all_dfs, ignore_index=True)
+print(f"合并后总行数: {len(combined):,}")
+
+# ============================================================
+# Data cleaning
+# ============================================================
+# 华氏转摄氏，过滤传感器故障值
+combined['Temperature_C'] = (combined['Temperature (F)'] - 32) * 5 / 9
+combined.loc[combined['Temperature (F)'] < 14, 'Temperature_C'] = None
+combined.loc[combined['Temperature (F)'] > 95, 'Temperature_C'] = None
+
+# 湿度异常值过滤
+combined.loc[combined['Humidity (%)'] < 0,   'Humidity (%)'] = None
+combined.loc[combined['Humidity (%)'] > 100,  'Humidity (%)'] = None
+
+# A/B通道一致性校验（差异超过70%剔除）
+col_a = 'PM2.5 A (CF=1) (ug/m3)'
+col_b = 'PM2.5 B (CF=1) (ug/m3)'
+combined['pm25_mean'] = (combined[col_a] + combined[col_b]) / 2
+diff = abs(combined[col_a] - combined[col_b])
+combined['ab_ok'] = diff / (combined['pm25_mean'] + 0.001) < 0.7
+n_before = len(combined)
+combined = combined[combined['ab_ok']].copy()
+print(f"A/B一致性过滤: {n_before:,} → {len(combined):,} 条")
+
+combined['pm25_raw'] = combined['pm25_mean']
+
+# ============================================================
+# Hourly Aggregation
+# ============================================================
+combined['datetime'] = pd.to_datetime(combined['date'], errors='coerce')
+combined['hour'] = combined['datetime'].dt.floor('h')
+
+hourly = combined.groupby('hour').agg(
+    RH            = ('Humidity (%)',    'mean'),
+    Temperature_C = ('Temperature_C',  'mean'),
+    pm25_raw      = ('pm25_raw',        'mean'),
+    record_count  = ('pm25_raw',        'count')
+).reset_index()
+
+hourly['hour'] = hourly['hour'].dt.tz_localize(None)
+print(f"\n聚合后小时记录数: {len(hourly):,}")
+print(f"时间范围: {hourly['hour'].min()} ~ {hourly['hour'].max()}")
+
+# ============================================================
+# Humidity correction（Crilley et al. 2018, κ=0.38）
+# ============================================================
+# 剔除RH=100%（传感器饱和）
+n_before = len(hourly)
+hourly = hourly[hourly['RH'] < 100].copy()
+print(f"\n剔除RH=100%: {n_before:,} → {len(hourly):,} 条")
+
+# RH截断至85%上限
+hourly['RH_capped'] = hourly['RH'].clip(upper=RH_CAP)
+
+# Köhler公式修正
+hourly['pm25_corrected'] = hourly['pm25_raw'] / (
+    1 + KAPPA * (hourly['RH_capped'] / (100 - hourly['RH_capped']))
+)
+
+# 计算修正幅度
+hourly['correction_factor'] = hourly['pm25_corrected'] / hourly['pm25_raw']
+
+print(f"\n修正前均值: {hourly['pm25_raw'].mean():.2f} μg/m³")
+print(f"修正后均值: {hourly['pm25_corrected'].mean():.2f} μg/m³")
+print(f"平均降幅:   {(1 - hourly['pm25_corrected'].mean()/hourly['pm25_raw'].mean())*100:.1f}%")
+
+# ============================================================
+# Retain only the data for the three winter months (Oct–Mar).
+# ============================================================
+hourly['month'] = hourly['hour'].dt.month
+hourly['year']  = hourly['hour'].dt.year
+
+# 定义三个冬季的时间范围
+winters = [
+    ('2022-10-01', '2023-03-31'),
+    ('2023-10-01', '2024-03-31'),
+    ('2024-10-01', '2025-03-31'),
+]
+
+masks = [
+    (hourly['hour'] >= pd.Timestamp(s)) & (hourly['hour'] <= pd.Timestamp(e))
+    for s, e in winters
+]
+import functools, operator
+hourly_winter = hourly[functools.reduce(operator.or_, masks)].copy()
+
+print(f"\n三个冬季筛选后: {len(hourly_winter):,} 条")
+
+# ============================================================
+# Generate a comparison table
+# ============================================================
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+output_cols = [
+    'hour',
+    'RH',
+    'RH_capped',
+    'Temperature_C',
+    'pm25_raw',
+    'pm25_corrected',
+    'correction_factor',
+    'record_count'
+]
+
+output_path = os.path.join(OUTPUT_DIR, f"{SENSOR_ID}_corrected.csv")
+hourly_winter[output_cols].to_csv(output_path, index=False, float_format='%.4f')
+print(f"\n结果已保存: {output_path}")
+
+# 按冬季打印简单统计
+print("\n=== 各冬季统计 ===")
+for s, e in winters:
+    mask = (hourly_winter['hour'] >= pd.Timestamp(s)) & (hourly_winter['hour'] <= pd.Timestamp(e))
+    w = hourly_winter[mask]
+    if len(w) == 0:
+        print(f"{s[:7]} ~ {e[:7]}: 无数据")
+        continue
+    print(f"{s[:7]} ~ {e[:7]}: "
+          f"{len(w):,} 小时, "
+          f"修正前均值={w['pm25_raw'].mean():.2f}, "
+          f"修正后均值={w['pm25_corrected'].mean():.2f} μg/m³")

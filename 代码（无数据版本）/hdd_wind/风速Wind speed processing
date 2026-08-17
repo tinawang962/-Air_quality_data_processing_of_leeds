@@ -1,0 +1,77 @@
+"""
+compute_evening_wind.py
+================================================
+import pandas as pd
+ Use only the wind speed records from the 18:00–23:00 evening window—since your dependent variable (the pronounced evening peak) occurs within this specific timeframe, the wind speed data must be aligned with the same period; do not use the all-day average (the all-day average is a separate sensitivity test, not the primary analysis).
+Calculate the average wind speed for these six hours to obtain a single value representing the "average evening wind speed" for that day.
+A valid reading requires actual observations for at least four of these six hours; if there are fewer than four hours of data, mark the day as missing (do not perform imputation).
+"""
+
+# ============================================================
+# 配置区
+# ============================================================
+EVENING_START, EVENING_END = 18, 23     # 晚间窗口, UTC
+MIN_HOURS_EVENING = 4                   # 6小时中最低有效小时数要求
+KNOTS_TO_MS = 0.514444                  # 节转米/秒的换算系数
+ 
+BRAMHAM_INPUT = 'bramham_hourly_temp_2022_2025_FINAL.csv'
+OUTPUT_PATH = 'evening_wind.csv'
+ 
+ 
+# ============================================================
+# 核心函数
+# ============================================================
+def compute_evening_wind(filepath, evening_start=EVENING_START, evening_end=EVENING_END,
+                          min_hours=MIN_HOURS_EVENING):
+    """
+    从Bramham逐小时数据, 计算每日晚间平均风速。
+ 
+    参数
+    ----
+    filepath : str
+        逐小时数据CSV文件路径, 需含datetime和wind_speed_knots两列
+    evening_start, evening_end : int
+        晚间窗口的起止小时(含), 默认18-23
+    min_hours : int
+        晚间窗口内最低有效小时数要求, 默认4(共6小时)
+ 
+    返回
+    ----
+    DataFrame, 含date, wind_speed_knots_evening, wind_speed_ms_evening,
+    n_hours_valid_evening
+    """
+    df = pd.read_csv(filepath)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df['date'] = df['datetime'].dt.normalize()
+    df['hour_of_day'] = df['datetime'].dt.hour
+ 
+    evening = df[df['hour_of_day'].between(evening_start, evening_end)].copy()
+ 
+    daily = evening.groupby('date')['wind_speed_knots'].agg(['mean', 'count']).reset_index()
+    daily.columns = ['date', 'wind_speed_knots_evening', 'n_hours_valid_evening']
+ 
+    daily = daily[daily['n_hours_valid_evening'] >= min_hours].copy()
+    daily['wind_speed_ms_evening'] = daily['wind_speed_knots_evening'] * KNOTS_TO_MS
+ 
+    return daily[['date', 'wind_speed_knots_evening', 'wind_speed_ms_evening', 'n_hours_valid_evening']]
+ 
+ 
+# ============================================================
+# 主流程
+# ============================================================
+def main():
+    print("Computing evening (18:00-23:00 UTC) mean wind speed from Bramham data...")
+    evening_wind = compute_evening_wind(BRAMHAM_INPUT)
+    print(f"  {len(evening_wind)} valid days")
+ 
+    evening_wind = evening_wind.sort_values('date')
+    evening_wind.to_csv(OUTPUT_PATH, index=False)
+ 
+    print(f"\nSaved: {OUTPUT_PATH}")
+    print(f"Total days: {len(evening_wind)}")
+    print(f"Date range: {evening_wind['date'].min()} to {evening_wind['date'].max()}")
+ 
+ 
+if __name__ == '__main__':
+    main()
+ 
