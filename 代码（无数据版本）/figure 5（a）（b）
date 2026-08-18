@@ -1,0 +1,139 @@
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+ 
+np.random.seed(42)
+ 
+DAILY_PEAK_STATS = 'daily_peak_stats_remerged.csv'
+BRAMHAM_HOURLY = 'bramham_hourly_temp_2022_2025_FINAL.csv'
+N_BOOT = 2000
+Y_MAX = 0.45
+ 
+ 
+# ============================================================
+# 第一步: 准备日层面数据(晚间风速版, n=521)
+# ============================================================
+def load_day_level_data(filepath):
+    daily = pd.read_csv(filepath)
+    daily['date'] = pd.to_datetime(daily['date'])
+    daily = daily[~daily['event_day']].copy()
+    day_agg = daily.groupby('date').agg(
+        n_valid_stations=('significant_evening_peak', 'size'),
+        n_significant=('significant_evening_peak', 'sum'),
+        hdd=('hdd_bradford', 'first'),
+        wind=('wind_speed_ms_evening', 'first'),
+        winter=('winter', 'first'),
+    ).reset_index()
+    d = day_agg.dropna(subset=['hdd', 'wind', 'winter']).copy()
+    d['winter'] = pd.Categorical(d['winter'], categories=['Winter1', 'Winter2', 'Winter3'], ordered=True)
+    return d
+ 
+ 
+# ============================================================
+# 第二步: 计算全天平均风速, 生成519天配对子集(用于Figure 6)
+# ============================================================
+def compute_allday_wind(filepath, min_hours=18):
+    df = pd.read_csv(filepath)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df['date'] = df['datetime'].dt.normalize()
+    daily = df.groupby('date')['wind_speed_knots'].agg(['mean', 'count']).reset_index()
+    daily.columns = ['date', 'wind_speed_knots_allday', 'n_hours']
+    daily = daily[daily['n_hours'] >= min_hours].copy()
+    daily['wind_speed_ms_allday'] = daily['wind_speed_knots_allday'] * 0.514444
+    return daily[['date', 'wind_speed_ms_allday']]
+ 
+ 
+# ============================================================
+# 第三步: 拟合M3, 计算平均边际预测曲线(含蒙特卡洛置信区间)
+# ============================================================
+def fit_m3(d, wind_col):
+    y = np.column_stack([d['n_significant'], d['n_valid_stations'] - d['n_significant']])
+    winter_dummies = pd.get_dummies(d['winter'], prefix='winter', drop_first=True).astype(float)
+    X = pd.concat([pd.DataFrame({'hdd': d['hdd'], 'wind': d[wind_col]}), winter_dummies], axis=1)
+    X = sm.add_constant(X)
+    model = sm.GLM(y, X, family=sm.families.Binomial()).fit()
+    dispersion = model.pearson_chi2 / model.df_resid
+    cov_adj = model.cov_params() * dispersion
+    return model, X, cov_adj
+ 
+ 
+def average_marginal_prediction(model, X_template, cov_adj, wind_grid, n_boot=N_BOOT):
+    beta_hat = model.params.values
+    wind_pos = X_template.columns.get_loc('wind')
+    beta_samples = np.random.multivariate_normal(beta_hat, cov_adj.values, size=n_boot)
+ 
+    point_est = np.zeros(len(wind_grid))
+    boot_draws = np.zeros((n_boot, len(wind_grid)))
+    for i, w in enumerate(wind_grid):
+        X_mod = X_template.values.copy()
+        X_mod[:, wind_pos] = w
+        eta = X_mod @ beta_hat
+        point_est[i] = (1 / (1 + np.exp(-eta))).mean()
+        eta_boot = X_mod @ beta_samples.T
+        boot_draws[:, i] = (1 / (1 + np.exp(-eta_boot))).mean(axis=0)
+ 
+    ci_lo = np.percentile(boot_draws, 2.5, axis=0)
+    ci_hi = np.percentile(boot_draws, 97.5, axis=0)
+    return point_est, ci_lo, ci_hi
+ 
+ 
+def make_plot(wind_grid, pred, ci_lo, ci_hi, obs_wind, xlabel, title, out_path):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.fill_between(wind_grid, ci_lo, ci_hi, color='steelblue', alpha=0.2, label='95% CI')
+    ax.plot(wind_grid, pred, color='steelblue', lw=2.2, label='Average marginal prediction')
+    ax.plot(obs_wind, np.full_like(obs_wind, -0.012), '|', color='gray', alpha=0.15,
+            markersize=8, markeredgewidth=1)
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel('Predicted probability of a significant evening PM$_{2.5}$ peak', fontsize=11)
+    ax.set_title(title, fontsize=11)
+    ax.set_ylim(-0.02, Y_MAX)
+    ax.set_xlim(wind_grid.min(), wind_grid.max())
+    ax.axhline(0, color='black', lw=0.5)
+    ax.legend(loc='upper right', fontsize=9)
+    ax.grid(alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    print(f"Saved: {out_path}")
+ 
+ 
+# ============================================================
+# 主流程
+# ============================================================
+def main():
+    # --- Figure 5: 晚间风速, n=521, 与Table 1完全一致 ---
+    d521 = load_day_level_data(DAILY_PEAK_STATS)
+    print(f"Evening-wind sample: n={len(d521)}")
+ 
+    model_eve, X_eve, cov_eve = fit_m3(d521, 'wind')
+    wind_grid_eve = np.linspace(d521['wind'].quantile(0.025), d521['wind'].quantile(0.975), 100)
+    pred_eve, lo_eve, hi_eve = average_marginal_prediction(model_eve, X_eve, cov_eve, wind_grid_eve)
+ 
+    make_plot(
+        wind_grid_eve, pred_eve, lo_eve, hi_eve, d521['wind'].values,
+        'Bramham evening mean wind speed, 18:00\u201323:00 (m s\u207b\u00b9)',
+        f'Predicted Probability vs Evening Wind Speed\n(average marginal prediction, n={len(d521)}, matches Table 1)',
+        'figure5_evening_wind_probability.png'
+    )
+ 
+    # --- Figure 6: 全天风速, n=519(配对子集) ---
+    allday_wind = compute_allday_wind(BRAMHAM_HOURLY)
+    d519 = d521.merge(allday_wind, on='date', how='inner')
+    print(f"Matched evening/all-day subset: n={len(d519)}")
+ 
+    model_all, X_all, cov_all = fit_m3(d519.rename(columns={'wind_speed_ms_allday': 'wind_allday'}).assign(wind=lambda x: x['wind_allday']), 'wind')
+    wind_grid_all = np.linspace(d519['wind_speed_ms_allday'].quantile(0.025), d519['wind_speed_ms_allday'].quantile(0.975), 100)
+    pred_all, lo_all, hi_all = average_marginal_prediction(model_all, X_all, cov_all, wind_grid_all)
+ 
+    make_plot(
+        wind_grid_all, pred_all, lo_all, hi_all, d519['wind_speed_ms_allday'].values,
+        'Bramham daily mean wind speed (m s\u207b\u00b9)',
+        f'Predicted Probability vs Daily Mean Wind Speed\n(average marginal prediction, n={len(d519)}, matched subset)',
+        'figure6_allday_wind_probability.png'
+    )
+ 
+ 
+if __name__ == '__main__':
+    main()
+ 
