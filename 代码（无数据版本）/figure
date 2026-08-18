@@ -1,1 +1,66 @@
 
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+ 
+# ============================================================
+# 配置区
+# ============================================================
+INPUT_PATH = 'daily_peak_stats_remerged.csv'
+OUTPUT_PATH = 'figure2_hour_of_max_by_hdd_bin.png'
+EVENING_START, EVENING_END = 18, 23
+HDD_BINS = [0, 4, 8, 12, np.inf]
+HDD_LABELS = ['HDD 0-4', 'HDD 4-8', 'HDD 8-12', 'HDD >12']
+ 
+ 
+# ============================================================
+# 主流程
+# ============================================================
+def main():
+    daily = pd.read_csv(INPUT_PATH)
+    daily['date'] = pd.to_datetime(daily['date'])
+    daily_excl = daily[~daily['event_day']].copy()
+    print(f"排除事件日后总station-day数: {len(daily_excl)}")
+ 
+    daily_excl['hdd_bin'] = pd.cut(daily_excl['hdd_bradford'], bins=HDD_BINS,
+                                    labels=HDD_LABELS, right=False)
+ 
+    # -------- 输出各分箱的具体百分比(对应3.2节文字) --------
+    print("\n各HDD分箱统计:")
+    for label in HDD_LABELS:
+        sub = daily_excl[daily_excl['hdd_bin'] == label]
+        n = len(sub)
+        pct_evening = (sub['hour_of_max'].between(EVENING_START, EVENING_END)).mean() * 100
+        pct_midnight = (sub['hour_of_max'] == 0).mean() * 100
+        print(f"  {label} (n={n}): 晚间窗口占比={pct_evening:.1f}%, 0点占比={pct_midnight:.2f}%")
+ 
+    overall_midnight = (daily_excl['hour_of_max'] == 0).mean() * 100
+    print(f"\n总体0点占比: {overall_midnight:.2f}%")
+ 
+    # -------- 画图 --------
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes = axes.flatten()
+ 
+    for i, label in enumerate(HDD_LABELS):
+        ax = axes[i]
+        sub = daily_excl[daily_excl['hdd_bin'] == label]
+        n = len(sub)
+        ax.hist(sub['hour_of_max'], bins=range(0, 26), color='steelblue',
+                 edgecolor='white', align='left')
+        ax.axvspan(EVENING_START, EVENING_END + 1, color='orange', alpha=0.15)
+        ax.set_title(f'{label}  (n={n})', fontsize=11)
+        ax.set_xlabel('Hour of daily PM2.5 max')
+        ax.set_ylabel('Count of station-days')
+        ax.set_xlim(-0.5, 24.5)
+        ax.set_xticks(range(0, 25, 5))
+ 
+    fig.suptitle('Hour of Daily PM2.5 Maximum by HDD Category\n'
+                  '(orange band = evening window 18:00-23:00, event days excluded)', fontsize=12)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_PATH, dpi=150)
+    print(f"\nSaved: {OUTPUT_PATH}")
+ 
+ 
+if __name__ == '__main__':
+    main()
+ 
