@@ -1,0 +1,108 @@
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from scipy import stats
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+ 
+# ============================================================
+# 配置区
+# ============================================================
+INPUT_PATH = 'daily_peak_stats_remerged.csv'
+OUTPUT_PATH = 'figure6_threshold_sensitivity_forest.png'
+ 
+THRESHOLDS = {
+    '90th (14.87, main)': 14.87,
+    '95th (19.48)': 19.48,
+    'Fixed +4': 4,
+    'Fixed +5': 5,
+    'Fixed +6': 6,
+}
+ 
+ 
+# ============================================================
+# 核心函数: 给定阈值和模型设定, 拟合并返回OR/CI
+# ============================================================
+def fit_model(daily_df, threshold, include_wind_winter):
+    d = daily_df.copy()
+    d['significant_evening_peak'] = (
+        (d['evening_peak_flag'] == 1) & (d['evening_peak_enhancement'] > threshold)
+    ).astype(int)
+ 
+    day_agg = d.groupby('date').agg(
+        n_valid_stations=('significant_evening_peak', 'size'),
+        n_significant=('significant_evening_peak', 'sum'),
+        hdd=('hdd_bradford', 'first'),
+        wind=('wind_speed_ms_evening', 'first'),
+        winter=('winter', 'first'),
+    ).reset_index()
+    d3 = day_agg.dropna(subset=['hdd', 'wind', 'winter'])
+ 
+    y = np.column_stack([d3['n_significant'], d3['n_valid_stations'] - d3['n_significant']])
+    X = pd.DataFrame({'hdd': d3['hdd']})
+    if include_wind_winter:
+        X['wind'] = d3['wind']
+        wd = pd.get_dummies(d3['winter'], prefix='winter', drop_first=True).astype(float)
+        X = pd.concat([X, wd], axis=1)
+    X = sm.add_constant(X)
+ 
+    model = sm.GLM(y, X, family=sm.families.Binomial()).fit()
+    dispersion = model.pearson_chi2 / model.df_resid
+    se_adj = model.bse['hdd'] * np.sqrt(dispersion)
+ 
+    return {
+        'n': len(d3),
+        'OR': np.exp(model.params['hdd']),
+        'CI_lo': np.exp(model.params['hdd'] - 1.96 * se_adj),
+        'CI_hi': np.exp(model.params['hdd'] + 1.96 * se_adj),
+    }
+ 
+ 
+# ============================================================
+# 主流程
+# ============================================================
+def main():
+    daily_raw = pd.read_csv(INPUT_PATH)
+    daily_raw['date'] = pd.to_datetime(daily_raw['date'])
+    daily_raw = daily_raw[~daily_raw['event_day']].copy()
+ 
+    results = []
+    for label, thresh in THRESHOLDS.items():
+        r_hdd = fit_model(daily_raw, thresh, include_wind_winter=False)
+        r_full = fit_model(daily_raw, thresh, include_wind_winter=True)
+        results.append({'threshold': label, 'model': 'HDD only', **r_hdd})
+        results.append({'threshold': label, 'model': 'HDD+Wind+Winter', **r_full})
+        print(f"{label}: HDD only OR={r_hdd['OR']:.3f} [{r_hdd['CI_lo']:.3f}-{r_hdd['CI_hi']:.3f}], "
+              f"HDD+Wind+Winter OR={r_full['OR']:.3f} [{r_full['CI_lo']:.3f}-{r_full['CI_hi']:.3f}]")
+ 
+    df = pd.DataFrame(results)
+ 
+    # -------- 画森林图(中性配色, 不用红蓝区分显著性) --------
+    fig, ax = plt.subplots(figsize=(8, 6))
+    y = 0
+    y_positions, labels = [], []
+    for label in THRESHOLDS.keys():
+        for model in ['HDD+Wind+Winter', 'HDD only']:
+            row = df[(df['threshold'] == label) & (df['model'] == model)].iloc[0]
+            ax.errorbar(row['OR'], y, xerr=[[row['OR'] - row['CI_lo']], [row['CI_hi'] - row['OR']]],
+                        fmt='o', color='dimgray', capsize=4, markersize=8, elinewidth=1.8)
+            y_positions.append(y)
+            labels.append(f"{label} \u2013 {model}")
+            y += 1
+        y += 0.5
+ 
+    ax.axvline(1, color='gray', linestyle='--', lw=1, zorder=0)
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlabel('Odds Ratio for HDD (95% CI)', fontsize=11)
+    ax.grid(axis='x', alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_PATH, dpi=150)
+    print(f"\nSaved: {OUTPUT_PATH}")
+ 
+ 
+if __name__ == '__main__':
+    main()
+ 
