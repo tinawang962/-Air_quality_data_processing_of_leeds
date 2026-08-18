@@ -1,0 +1,113 @@
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from scipy import stats
+import matplotlib.pyplot as plt
+ 
+# ============================================================
+# 配置区
+# ============================================================
+INPUT_PATH = 'daily_peak_stats_remerged.csv'
+TABLE_OUTPUT = 'table1_main_models.csv'
+FIGURE_OUTPUT = 'figure4_model_progression.png'
+ 
+ 
+# ============================================================
+# 第一步: 读取数据, 排除事件日, 聚合到日层面
+# ============================================================
+def load_day_level_data(filepath):
+    daily = pd.read_csv(filepath)
+    daily['date'] = pd.to_datetime(daily['date'])
+    daily = daily[~daily['event_day']].copy()
+ 
+    day_agg = daily.groupby('date').agg(
+        n_valid_stations=('significant_evening_peak', 'size'),
+        n_significant=('significant_evening_peak', 'sum'),
+        hdd=('hdd_bradford', 'first'),
+        wind=('wind_speed_ms_evening', 'first'),
+        winter=('winter', 'first'),
+    ).reset_index()
+ 
+    d = day_agg.dropna(subset=['hdd', 'wind', 'winter']).copy()
+    d['winter'] = pd.Categorical(d['winter'], categories=['Winter1', 'Winter2', 'Winter3'], ordered=True)
+    return d
+ 
+ 
+# ============================================================
+# 第二步: 拟合单个模型, 返回HDD系数的完整统计量(过度离散调整后)
+# ============================================================
+def fit_model(d, include_wind=False, include_winter=False):
+    y = np.column_stack([d['n_significant'], d['n_valid_stations'] - d['n_significant']])
+    X = pd.DataFrame({'hdd': d['hdd']})
+    if include_wind:
+        X['wind'] = d['wind']
+    if include_winter:
+        winter_dummies = pd.get_dummies(d['winter'], prefix='winter', drop_first=True).astype(float)
+        X = pd.concat([X, winter_dummies], axis=1)
+    X = sm.add_constant(X)
+ 
+    model = sm.GLM(y, X, family=sm.families.Binomial()).fit()
+    dispersion = model.pearson_chi2 / model.df_resid
+    se_adj = model.bse['hdd'] * np.sqrt(dispersion)
+    p_adj = 2 * (1 - stats.norm.cdf(abs(model.params['hdd'] / se_adj)))
+ 
+    return {
+        'coef': model.params['hdd'],
+        'se_adj': se_adj,
+        'OR': np.exp(model.params['hdd']),
+        'CI_lo': np.exp(model.params['hdd'] - 1.96 * se_adj),
+        'CI_hi': np.exp(model.params['hdd'] + 1.96 * se_adj),
+        'p_adj': p_adj,
+        'dispersion': dispersion,
+        'n': len(d),
+    }
+ 
+ 
+# ============================================================
+# 主流程
+# ============================================================
+def main():
+    d = load_day_level_data(INPUT_PATH)
+    print(f"Complete-case sample: n={len(d)}")
+    print(d['winter'].value_counts())
+ 
+    m1 = fit_model(d, include_wind=False, include_winter=False)
+    m2 = fit_model(d, include_wind=True, include_winter=False)
+    m3 = fit_model(d, include_wind=True, include_winter=True)
+ 
+    results = pd.DataFrame([
+        {'Model': 'M1: HDD only', **m1},
+        {'Model': 'M2: HDD + wind', **m2},
+        {'Model': 'M3: HDD + wind + winter', **m3},
+    ])
+    results = results[['Model', 'coef', 'OR', 'CI_lo', 'CI_hi', 'p_adj', 'dispersion', 'n']]
+    results.columns = ['Model', 'HDD_beta', 'OR', 'CI_low', 'CI_high', 'Overdispersion_adjusted_p', 'Dispersion', 'n']
+ 
+    print("\n" + results.to_string(index=False))
+    results.to_csv(TABLE_OUTPUT, index=False)
+    print(f"\nSaved: {TABLE_OUTPUT}")
+ 
+    # ============================================================
+    # Figure 4: 森林图, 中性配色, 不用红蓝暗示显著性
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(7.5, 4))
+    models_labels = ['M1: HDD only', 'M2: HDD + Wind', 'M3: HDD + Wind\n+ Winter']
+    for i, row in enumerate(results.itertuples()):
+        y_pos = len(results) - 1 - i  # M1在最上面
+        ax.errorbar(row.OR, y_pos, xerr=[[row.OR - row.CI_low], [row.CI_high - row.OR]],
+                    fmt='o', color='dimgray', capsize=5, markersize=11, elinewidth=2.2)
+ 
+    ax.axvline(1, color='gray', linestyle='--', lw=1, zorder=0)
+    ax.set_yticks(range(len(results)))
+    ax.set_yticklabels(models_labels[::-1], fontsize=10)
+    ax.set_xlabel('Odds Ratio for HDD (95% CI)', fontsize=11)
+    ax.grid(axis='x', alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(FIGURE_OUTPUT, dpi=150)
+    print(f"Saved: {FIGURE_OUTPUT}")
+ 
+ 
+if __name__ == '__main__':
+    main()
+ 
